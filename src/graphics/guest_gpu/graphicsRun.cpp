@@ -1339,7 +1339,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
-						    (eop_event_type == 0x28 && event_index == 0x00)) {
+						    ((eop_event_type == 0x14 || eop_event_type == 0x28) &&
+						     event_index == 0x00)) {
 							if (with_interrupt) {
 								Sync::WriteAtEndOfPipeWithInterrupt64(
 								    m_submit_id, CurrentBuffer(), dst, clock, m_interrupt_event_id,
@@ -1354,7 +1355,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					case 0x38:
 						if ((eop_event_type == 0x04 &&
 						     (event_index == 0x00 || event_index == 0x05)) ||
-						    (eop_event_type == 0x28 && event_index == 0x00)) {
+						    ((eop_event_type == 0x14 || eop_event_type == 0x28) &&
+						     event_index == 0x00)) {
 							if (with_interrupt) {
 								Sync::WriteAtEndOfPipeWithInterruptWriteBack64(
 								    m_submit_id, CurrentBuffer(), dst, clock, m_interrupt_event_id,
