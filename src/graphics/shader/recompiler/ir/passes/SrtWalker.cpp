@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -461,13 +462,48 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+struct EvaluatorScratch {
+	std::unordered_map<const Inst*, uint64_t> cache;
+	std::vector<const Inst*>                  visiting;
+};
+
+class EvaluatorScratchPool {
+public:
+	static EvaluatorScratch& Acquire() {
+		auto& pool = Pool();
+		if (pool.depth == pool.slots.size()) {
+			pool.slots.push_back(std::make_unique<EvaluatorScratch>());
+		}
+		auto& scratch = *pool.slots[pool.depth++];
+		scratch.cache.clear();
+		scratch.visiting.clear();
+		return scratch;
+	}
+	static void Release() { Pool().depth--; }
+
+private:
+	struct PoolData {
+		std::vector<std::unique_ptr<EvaluatorScratch>> slots;
+		size_t                                         depth = 0;
+	};
+	static PoolData& Pool() {
+		static thread_local PoolData pool;
+		return pool;
+	}
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_scratch(EvaluatorScratchPool::Acquire()), m_cache(m_scratch.cache),
+	      m_visiting(m_scratch.visiting) {}
+	~Evaluator() { EvaluatorScratchPool::Release(); }
+	Evaluator(const Evaluator&)            = delete;
+	Evaluator& operator=(const Evaluator&) = delete;
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -500,11 +536,6 @@ private:
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
 			return false;
-		}
-		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
-			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
@@ -981,10 +1012,10 @@ private:
 	const SrtRuntime&                         m_runtime;
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
-	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
+	Value                                      m_active_mask;
+	EvaluatorScratch&                          m_scratch;
+	std::unordered_map<const Inst*, uint64_t>& m_cache;
+	std::vector<const Inst*>&                  m_visiting;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
