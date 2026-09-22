@@ -1143,7 +1143,12 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 	const auto range        = desc.info.metadata.range;
 	const auto current_tick = m_scheduler.CurrentTick();
-	bool       already_resolved_this_tick;
+	const auto layers       = desc.info.TransferLayers();
+	const auto& view           = desc.view_info;
+	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
+	const auto  first          = volume_texture ? 0u : metadata_base_layer;
+	const auto  image_first    = volume_texture ? 0u : view.base_layer;
+	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
@@ -1162,24 +1167,23 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		// after the first check, so later FindImage calls for the same image this tick are
 		// redundant. A real re-clear in a later recording still gets caught, since the tick will
 		// have advanced.
-		already_resolved_this_tick   = image.dcc_clear_checked_tick == current_tick;
-		image.dcc_clear_checked_tick = current_tick;
+		const bool already_resolved_this_tick =
+		    image.dcc_clear_checked_tick == current_tick &&
+		    image.dcc_clear_checked_first == first && image.dcc_clear_checked_count == count;
+		image.dcc_clear_checked_tick  = current_tick;
+		image.dcc_clear_checked_first = first;
+		image.dcc_clear_checked_count = count;
+		if (already_resolved_this_tick &&
+		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+			return;
+		}
 	}
-	if (already_resolved_this_tick) {
-		return;
-	}
-	const auto layers = desc.info.TransferLayers();
 	// These one-mip surfaces use complete 4 KiB DCC metadata blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: DCC slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = desc.view_info;
-	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
-	const auto  first          = volume_texture ? 0u : metadata_base_layer;
-	const auto  image_first    = volume_texture ? 0u : view.base_layer;
-	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: DCC view exceeds its native metadata slices\n");
 	}

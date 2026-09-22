@@ -1,13 +1,13 @@
 // Compiles a ResourcePlan's reachable SRT expression graph into a flat, topologically-ordered
-// CompiledSrtProgram once per unique shader, so per-draw evaluation (ExecuteSrtProgram) is a
-// single forward loop over an array instead of SrtWalker.cpp's Evaluator recursively re-walking
-// the same Inst graph, node by node, through a switch on every single draw.
+// CompiledSrtProgram once per unique shader, so per-draw evaluation (SrtExecution) indexes a
+// flat array instead of SrtWalker.cpp's Evaluator re-walking the same Inst graph, node by node,
+// on every single draw.
 //
 // This file is a deliberately case-by-case port of Evaluator::EvaluateInst/EvaluateRawRead/
 // EvaluateExtract (SrtWalker.cpp) split into two halves per opcode: a Compile-time half (this
 // file's Compiler class) that resolves everything structural/static once -- operand slots,
 // MemoryFlags, SRT slot indices, component indices, the "is this SRT slot clean" flag -- and an
-// execute-time half (ExecuteSrtProgram) that does only the genuinely runtime-dependent work
+// execute-time half (SrtExecution) that does only the genuinely runtime-dependent work
 // (user_data lookups, guest memory reads, and the arithmetic itself). Every case here should be
 // read side-by-side with its EvaluateInst counterpart; anything that doesn't map cleanly compiles
 // to AlwaysFails rather than guessing, matching EvaluateInst's own `default: break;`.
@@ -18,7 +18,7 @@
 // the interpreter exactly). SelectU32/U1/F32 gets its own CompiledOpKind rather than folding into
 // the generic arithmetic dispatch: this codebase's Select resolves its predicate through the
 // clean pass (when one is available) and only evaluates the branch it actually selects, unlike a
-// plain eager ternary -- see CompiledOpKind::Select's case in ExecutePass below.
+// plain eager ternary -- see CompiledOpKind::Select's case in SrtExecution::Evaluate below.
 //
 // Two facts from ExtractResourcePlan (ResourceMaterialization.cpp) shape this compiler:
 //   - Its Clone lambda already resolves every Phi to its invariant value or leaves it unreachable,
@@ -36,6 +36,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -90,9 +91,6 @@ public:
 			    condition.IsEmpty() ? kInvalidSlot : CompileValue(condition);
 		}
 		result.ops = std::move(m_ops);
-		result.needs_clean_pass =
-		    !m_program.control_flow.empty() ||
-		    std::ranges::any_of(m_program.clean_flat_slots, [](uint8_t clean) { return clean != 0u; });
 		return result;
 	}
 
@@ -104,8 +102,7 @@ private:
 	}
 
 	// Post-order: every operand this node references is compiled (and therefore already has a
-	// lower slot index in m_ops) before this node's own CompiledOp is appended -- the invariant
-	// ExecuteSrtProgram's single forward pass depends on.
+	// lower slot index in m_ops) before this node's own CompiledOp is appended.
 	uint32_t CompileValue(Value value) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
@@ -330,9 +327,9 @@ private:
 	}
 
 	// Mirrors EvaluateInst's Select case: the predicate is resolved through the clean pass (see
-	// ExecutePass), and only the branch it selects is ever compiled to require a value -- but
-	// both branches still need their own slots compiled here so the flat array stays complete for
-	// anyone else referencing the same nodes.
+	// SrtExecution::Evaluate), and only the branch it selects is ever compiled to require a value
+	// -- but both branches still need their own slots compiled here so the flat array stays
+	// complete for anyone else referencing the same nodes.
 	CompiledOp CompileSelect(const Inst& inst) {
 		if (inst.NumArgs() != 3) {
 			return AlwaysFailsOp();
@@ -466,381 +463,344 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 float    Float32(uint64_t bits) { return std::bit_cast<float>(static_cast<uint32_t>(bits)); }
 uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
 
-// One forward pass over `compiled.ops`. Topological order guarantees every operand slot an op
-// reads was already produced earlier in this same pass, so this never recurses except for
-// ReadFirstLane, which by definition needs a fresh, independently-scoped nested pass (matching
-// Evaluator's brand-new-instance-per-ReadFirstLane behaviour -- see SrtCompiler.h).
-void ExecutePass(const CompiledSrtProgram& compiled, SrtMemoryReader read_memory, void* userdata,
-                 std::span<const uint32_t> user_data, uint64_t shader_base,
-                 SrtExecutorScratch& scratch, uint32_t active_mask_slot,
-                 const SrtExecutorScratch* clean_scratch) {
-	KYTY_PROFILER_FUNCTION();
-	const auto count = compiled.ops.size();
-	if (scratch.results.size() < count) {
-		scratch.results.resize(count);
-		scratch.computed.resize(count);
-	}
-	auto* results  = scratch.results.data();
-	auto* computed = scratch.computed.data();
-	// One memset instead of a `computed[i] = 0u` store threaded through every loop iteration below
-	// -- same total writes, but as a single vectorizable pass instead of interleaved with each op's
-	// own branchy case body.
-	std::memset(computed, 0, count * sizeof(*computed));
-
-	const auto operand_ok = [&](const CompiledOp& op, uint32_t index) {
-		const auto slot = op.operands[index];
-		return slot != kInvalidSlot && computed[slot] != 0u;
-	};
-
-	for (uint32_t i = 0; i < count; i++) {
-		const auto& op = compiled.ops[i];
-		switch (op.kind) {
-			case CompiledOpKind::AlwaysFails: break;
-			case CompiledOpKind::Constant:
-				results[i]  = op.immediate;
-				computed[i] = 1u;
-				break;
-			case CompiledOpKind::GetUserData:
-				if (op.immediate < user_data.size()) {
-					results[i]  = user_data[op.immediate];
-					computed[i] = 1u;
-				}
-				break;
-			case CompiledOpKind::GetShaderBase:
-				results[i]  = shader_base;
-				computed[i] = 1u;
-				break;
-			case CompiledOpKind::ReadFirstLane: {
-				if (!operand_ok(op, 0) || !operand_ok(op, 1)) {
-					break;
-				}
-				// This nested pass must not reuse (or pollute) the outer pass's cache, since the
-				// active-mask shortcut below can make the same slot evaluate differently
-				// depending on which mask scope is active -- each nesting depth needs its own,
-				// independent storage (matching Evaluator's brand-new-instance-per-ReadFirstLane
-				// behaviour). A bare thread_local buffer isn't safe here: a ReadFirstLane whose
-				// own mask operand is itself gated by another ReadFirstLane recurses into this
-				// same case, and the inner call's reset would clobber the outer call's in-flight
-				// state. Instead, borrow slot g_nested_scratch_depth from a thread_local pool
-				// indexed by nesting depth -- each depth gets its own buffer, reused across calls
-				// instead of freshly heap-allocated every single time (ReadFirstLane is common
-				// enough in SRT graphs that a fresh pair of vector allocations per hit was
-				// measurable). std::deque, not std::vector: growing it while this frame still
-				// holds `nested_scratch` as a reference must not invalidate that reference, which
-				// vector's reallocation-on-growth would risk if a deeper nested call grows the
-				// pool while this frame is still using its own slot.
-				thread_local std::deque<SrtExecutorScratch> g_nested_scratch_pool;
-				thread_local uint32_t                       g_nested_scratch_depth = 0;
-				if (g_nested_scratch_pool.size() <= g_nested_scratch_depth) {
-					g_nested_scratch_pool.emplace_back();
-				}
-				auto& nested_scratch = g_nested_scratch_pool[g_nested_scratch_depth];
-				++g_nested_scratch_depth;
-				ExecutePass(compiled, read_memory, userdata, user_data, shader_base, nested_scratch,
-				           op.operands[1], clean_scratch);
-				--g_nested_scratch_depth;
-				const auto value_slot = op.operands[0];
-				if (nested_scratch.computed[value_slot] != 0u) {
-					results[i]  = nested_scratch.results[value_slot];
-					computed[i] = 1u;
-				}
-				break;
-			}
-			case CompiledOpKind::ReadConst: {
-				const auto* source_results  = op.srt_slot_clean && clean_scratch != nullptr
-				                                  ? clean_scratch->results.data()
-				                                  : results;
-				const auto* source_computed = op.srt_slot_clean && clean_scratch != nullptr
-				                                   ? clean_scratch->computed.data()
-				                                   : computed;
-				const auto  slot            = op.operands[0];
-				const auto  available = op.srt_slot_clean && clean_scratch != nullptr
-				                             ? slot < clean_scratch->computed.size()
-				                             : true;
-				if (available && source_computed[slot] != 0u) {
-					results[i]  = source_results[slot];
-					computed[i] = 1u;
-				}
-				break;
-			}
-			case CompiledOpKind::ExtractU64: {
-				if (!operand_ok(op, 0)) {
-					break;
-				}
-				const auto packed = results[op.operands[0]];
-				results[i]        = static_cast<uint32_t>(packed >> (op.component * 32u));
-				computed[i]       = 1u;
-				break;
-			}
-			case CompiledOpKind::ExtractPassthrough: {
-				if (!operand_ok(op, 0)) {
-					break;
-				}
-				results[i]  = results[op.operands[0]];
-				computed[i] = 1u;
-				break;
-			}
-			case CompiledOpKind::ExtractCarryHalf: {
-				if (!operand_ok(op, 0) || !operand_ok(op, 1)) {
-					break;
-				}
-				const auto lhs = results[op.operands[0]];
-				const auto rhs = results[op.operands[1]];
-				const auto sum =
-				    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
-				results[i] = op.component == 0u ? static_cast<uint32_t>(sum)
-				                                 : static_cast<uint32_t>(sum >> 32u);
-				computed[i] = 1u;
-				break;
-			}
-			case CompiledOpKind::RawRead: {
-				if (!operand_ok(op, 0) || !operand_ok(op, 1) || !operand_ok(op, 2)) {
-					break;
-				}
-				const auto low    = results[op.operands[0]];
-				const auto high   = results[op.operands[1]];
-				const auto offset = results[op.operands[2]];
-				const auto base   = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-				const auto immediate = static_cast<int64_t>(op.immediate);
-				uint64_t   address   = 0;
-				if (op.is_const_buffer_read) {
-					if (!operand_ok(op, 3) || !operand_ok(op, 4)) {
-						break;
-					}
-					const auto records = results[op.operands[3]];
-					if (immediate < 0) {
-						break;
-					}
-					const auto byte_offset =
-					    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
-					const auto aligned = byte_offset & ~uint64_t {3};
-					const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-					const auto size    = stride == 0u
-					                         ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-					                         : static_cast<uint64_t>(stride) *
-					                               static_cast<uint32_t>(records);
-					if (aligned > size || size - aligned < sizeof(uint32_t)) {
-						break;
-					}
-					address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
-				} else {
-					const auto relative = (immediate & ~int64_t {3}) +
-					                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-					if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-						break;
-					}
-				}
-				uint32_t word = 0;
-				if (read_memory != nullptr) {
-					if (!read_memory(userdata, address, &word)) {
-						break;
-					}
-				} else {
-					std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-				}
-				results[i]  = word;
-				computed[i] = 1u;
-				break;
-			}
-			case CompiledOpKind::Select: {
-				// Active-mask shortcut: matches EvaluateWide's `inst->Arg(0).Resolve() ==
-				// m_active_mask` check -- here, "the same Inst*" is "the same compiled slot". If
-				// this Select's own predicate is the ReadFirstLane mask currently in scope, the
-				// lane(s) being read are definitionally inside that mask, so the predicate must
-				// be true for them -- take the true branch without evaluating the predicate.
-				if (active_mask_slot != kInvalidSlot && op.operands[0] == active_mask_slot) {
-					if (!operand_ok(op, 1)) {
-						break;
-					}
-					results[i]  = results[op.operands[1]];
-					computed[i] = 1u;
-					break;
-				}
-				// Otherwise mirrors EvaluateInst's Select case: the predicate is resolved
-				// against the clean pass (when one is available) rather than this pass's own
-				// results -- matching `m_clean_evaluator != nullptr ? *m_clean_evaluator :
-				// *this` -- and only the branch the predicate actually selects is required; the
-				// other is never touched, exactly like the interpreter's lazy Arg() call on only
-				// one branch.
-				const auto* pred_results  = clean_scratch != nullptr
-				                                ? clean_scratch->results.data()
-				                                : results;
-				const auto* pred_computed = clean_scratch != nullptr
-				                                 ? clean_scratch->computed.data()
-				                                 : computed;
-				const auto  pred_slot = op.operands[0];
-				const auto  pred_available =
-				    clean_scratch != nullptr ? pred_slot < clean_scratch->computed.size() : true;
-				if (!pred_available || pred_computed[pred_slot] == 0u) {
-					break;
-				}
-				const auto chosen = op.operands[pred_results[pred_slot] != 0u ? 1u : 2u];
-				if (chosen == kInvalidSlot || computed[chosen] == 0u) {
-					break;
-				}
-				results[i]  = results[chosen];
-				computed[i] = 1u;
-				break;
-			}
-			case CompiledOpKind::Generic: {
-				bool ok = true;
-				for (uint8_t a = 0; a < op.num_operands && ok; a++) {
-					ok = operand_ok(op, a);
-				}
-				if (!ok) {
-					break;
-				}
-				const auto a = results[op.operands[0]];
-				const auto b = op.num_operands > 1 ? results[op.operands[1]] : 0;
-				const auto c = op.num_operands > 2 ? results[op.operands[2]] : 0;
-				const auto d = op.num_operands > 3 ? results[op.operands[3]] : 0;
-				uint64_t   result = 0;
-				bool       valid  = true;
-				switch (op.opcode) {
-					case ValueOpcode::BitCastU32F32:
-					case ValueOpcode::BitCastF32U32: result = a; break;
-					case ValueOpcode::CompositeConstructU64:
-						result = static_cast<uint32_t>(a) |
-						         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
-						break;
-					case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
-					case ValueOpcode::IAdd64: result = a + b; break;
-					case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
-					case ValueOpcode::ISub64: result = a - b; break;
-					case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
-					case ValueOpcode::IMul64: result = a * b; break;
-					case ValueOpcode::UMin32:
-						result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
-						break;
-					case ValueOpcode::ConvertF32U32:
-						result = Float32Bits(static_cast<float>(static_cast<uint32_t>(a)));
-						break;
-					case ValueOpcode::ConvertU32F32: {
-						const auto value = Float32(a);
-						if (!std::isfinite(value) || value < 0.0f ||
-						    static_cast<double>(value) > UINT32_MAX) {
-							valid = false;
-							break;
-						}
-						result = static_cast<uint32_t>(value);
-						break;
-					}
-					case ValueOpcode::FPMul32: result = Float32Bits(Float32(a) * Float32(b)); break;
-					case ValueOpcode::FPTrunc32: result = Float32Bits(std::trunc(Float32(a))); break;
-					case ValueOpcode::FPIsNan32: result = std::isnan(Float32(a)); break;
-					case ValueOpcode::FPOrdLessThanEqual32: result = Float32(a) <= Float32(b); break;
-					case ValueOpcode::FPOrdGreaterThanEqual32:
-						result = Float32(a) >= Float32(b);
-						break;
-					case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); break;
-					case ValueOpcode::BitwiseAnd64: result = a & b; break;
-					case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); break;
-					case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); break;
-					case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); break;
-					case ValueOpcode::ShiftLeftLogical32:
-						result = static_cast<uint32_t>(a) << (b & 31u);
-						break;
-					case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); break;
-					case ValueOpcode::ShiftRightLogical32:
-						result = static_cast<uint32_t>(a) >> (b & 31u);
-						break;
-					case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); break;
-					case ValueOpcode::ShiftRightArithmetic32:
-						result = static_cast<uint32_t>(
-						    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
-						break;
-					case ValueOpcode::ShiftRightArithmetic64:
-						result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
-						break;
-					case ValueOpcode::BitFieldUExtract: {
-						const auto offset = static_cast<uint32_t>(b);
-						const auto width  = static_cast<uint32_t>(c);
-						if (offset > 32u || width > 32u - offset) {
-							valid = false;
-							break;
-						}
-						const auto mask = width == 32u  ? UINT32_MAX
-						                  : width == 0u ? 0u
-						                                : (uint32_t {1} << width) - 1u;
-						result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
-						break;
-					}
-					case ValueOpcode::BitFieldSExtract: {
-						const auto offset = static_cast<uint32_t>(b);
-						const auto width  = static_cast<uint32_t>(c);
-						if (offset > 32u || width > 32u - offset) {
-							valid = false;
-							break;
-						}
-						if (width == 0u) {
-							result = 0;
-							break;
-						}
-						const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
-						auto       bits = (static_cast<uint32_t>(a) >> offset) & mask;
-						if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
-							bits |= ~mask;
-						}
-						result = bits;
-						break;
-					}
-					case ValueOpcode::BitFieldInsert: {
-						const auto offset = static_cast<uint32_t>(c);
-						const auto width  = static_cast<uint32_t>(d);
-						if (offset > 32u || width > 32u - offset) {
-							valid = false;
-							break;
-						}
-						if (width == 0u) {
-							result = static_cast<uint32_t>(a);
-							break;
-						}
-						const auto mask =
-						    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
-						result = (static_cast<uint32_t>(a) & ~mask) |
-						         ((static_cast<uint32_t>(b) << offset) & mask);
-						break;
-					}
-					case ValueOpcode::IEqual32:
-						result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::INotEqual32:
-						result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::ULessThan32:
-						result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::UGreaterThan32:
-						result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::LogicalAnd: result = (a != 0u) && (b != 0u); break;
-					case ValueOpcode::LogicalOr: result = (a != 0u) || (b != 0u); break;
-					case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); break;
-					case ValueOpcode::LogicalNot: result = a == 0u; break;
-					default: valid = false; break;
-				}
-				if (valid) {
-					results[i]  = result;
-					computed[i] = 1u;
-				}
-				break;
-			}
-		}
-	}
-}
-
 } // namespace
 
 CompiledSrtProgram CompileSrtProgram(const ResourcePlan& program) {
 	return Compiler(program).Run();
 }
 
-void ExecuteSrtProgram(const CompiledSrtProgram& compiled, SrtMemoryReader read_memory,
-                       void* userdata, std::span<const uint32_t> user_data, uint64_t shader_base,
-                       SrtExecutorScratch& scratch, uint32_t active_mask_slot,
-                       const SrtExecutorScratch* clean_scratch) {
-	ExecutePass(compiled, read_memory, userdata, user_data, shader_base, scratch, active_mask_slot,
-	           clean_scratch);
+SrtExecution::SrtExecution(const CompiledSrtProgram& compiled, const SrtRuntime& runtime,
+                           SrtExecutorScratch& clean_scratch, SrtExecutorScratch& raw_scratch)
+    : SrtExecution(compiled, runtime.read_specialization_memory, runtime.read_memory,
+                   runtime.userdata, runtime.user_data, runtime.shader_base, clean_scratch,
+                   raw_scratch, kInvalidSlot) {}
+
+SrtExecution::SrtExecution(const CompiledSrtProgram& compiled, SrtMemoryReader clean_read,
+                           SrtMemoryReader raw_read, void* userdata,
+                           std::span<const uint32_t> user_data, uint64_t shader_base,
+                           SrtExecutorScratch& clean, SrtExecutorScratch& raw,
+                           uint32_t active_mask_slot)
+    : m_compiled(compiled), m_clean_read(clean_read), m_raw_read(raw_read), m_userdata(userdata),
+      m_user_data(user_data), m_shader_base(shader_base), m_clean(clean), m_raw(raw),
+      m_active_mask_slot(active_mask_slot) {
+	Reset(m_clean);
+	Reset(m_raw);
+}
+
+bool SrtExecution::Demand(bool clean, uint32_t slot, uint64_t& value) {
+	auto& scratch = clean ? m_clean : m_raw;
+	if (slot >= m_compiled.ops.size()) {
+		return false;
+	}
+	switch (scratch.computed[slot]) {
+		case Computed: value = scratch.results[slot]; return true;
+		case Failed: return false;
+		case Visiting: return false;
+		default: break;
+	}
+	scratch.computed[slot] = Visiting;
+	uint64_t   out = 0;
+	const bool ok  = Evaluate(clean, slot, out);
+	scratch.results[slot]  = out;
+	scratch.computed[slot] = ok ? Computed : Failed;
+	value                  = out;
+	return ok;
+}
+
+void SrtExecution::Reset(SrtExecutorScratch& scratch) const {
+	const auto count = m_compiled.ops.size();
+	if (scratch.results.size() < count) {
+		scratch.results.resize(count);
+		scratch.computed.resize(count);
+	}
+	std::memset(scratch.computed.data(), Untried, count * sizeof(scratch.computed[0]));
+}
+
+bool SrtExecution::Operand(bool clean, const CompiledOp& op, uint32_t index,
+                           uint64_t& value) {
+	const auto slot = op.operands[index];
+	return slot != kInvalidSlot && Demand(clean, slot, value);
+}
+
+bool SrtExecution::Evaluate(bool clean, uint32_t i, uint64_t& result) {
+	const auto& op = m_compiled.ops[i];
+	switch (op.kind) {
+		case CompiledOpKind::AlwaysFails: return false;
+		case CompiledOpKind::Constant: result = op.immediate; return true;
+		case CompiledOpKind::GetUserData:
+			if (op.immediate >= m_user_data.size()) {
+				return false;
+			}
+			result = m_user_data[op.immediate];
+			return true;
+		case CompiledOpKind::GetShaderBase: result = m_shader_base; return true;
+		case CompiledOpKind::ReadFirstLane: {
+			// This nested pass must not reuse (or pollute) the outer pass's cache, since the
+			// active-mask shortcut below can make the same slot evaluate differently
+			// depending on which mask scope is active -- each nesting depth needs its own,
+			// independent storage (matching Evaluator's brand-new-instance-per-ReadFirstLane
+			// behaviour). A bare thread_local buffer isn't safe here: a ReadFirstLane whose
+			// own mask operand is itself gated by another ReadFirstLane recurses into this
+			// same case, and the inner call's reset would clobber the outer call's in-flight
+			// state. Instead, borrow slot g_nested_scratch_depth from a thread_local pool
+			// indexed by nesting depth -- each depth gets its own buffer, reused across calls
+			// instead of freshly heap-allocated every single time (ReadFirstLane is common
+			// enough in SRT graphs that a fresh pair of vector allocations per hit was
+			// measurable). std::deque, not std::vector: growing it while this frame still
+			// holds `nested_scratch` as a reference must not invalidate that reference, which
+			// vector's reallocation-on-growth would risk if a deeper nested call grows the
+			// pool while this frame is still using its own slot.
+			thread_local std::deque<std::pair<SrtExecutorScratch, SrtExecutorScratch>>
+			                      g_nested_scratch_pool;
+			thread_local uint32_t g_nested_scratch_depth = 0;
+			if (g_nested_scratch_pool.size() <= g_nested_scratch_depth) {
+				g_nested_scratch_pool.emplace_back();
+			}
+			auto& nested_scratch = g_nested_scratch_pool[g_nested_scratch_depth];
+			++g_nested_scratch_depth;
+			SrtExecution nested(m_compiled, m_clean_read, clean ? m_clean_read : m_raw_read,
+			                    m_userdata, m_user_data, m_shader_base, nested_scratch.first,
+			                    nested_scratch.second, op.operands[1]);
+			const bool ok = nested.Demand(false, op.operands[0], result);
+			--g_nested_scratch_depth;
+			return ok;
+		}
+		case CompiledOpKind::ReadConst:
+			return Demand(clean || op.srt_slot_clean, op.operands[0], result);
+		case CompiledOpKind::ExtractU64: {
+			uint64_t packed = 0;
+			if (!Operand(clean, op, 0, packed)) {
+				return false;
+			}
+			result = static_cast<uint32_t>(packed >> (op.component * 32u));
+			return true;
+		}
+		case CompiledOpKind::ExtractPassthrough: return Operand(clean, op, 0, result);
+		case CompiledOpKind::ExtractCarryHalf: {
+			uint64_t lhs = 0;
+			uint64_t rhs = 0;
+			if (!Operand(clean, op, 0, lhs) || !Operand(clean, op, 1, rhs)) {
+				return false;
+			}
+			const auto sum =
+			    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
+			result = op.component == 0u ? static_cast<uint32_t>(sum)
+			                            : static_cast<uint32_t>(sum >> 32u);
+			return true;
+		}
+		case CompiledOpKind::RawRead: return RawRead(clean, op, result);
+		case CompiledOpKind::Select: {
+			// Active-mask shortcut: matches EvaluateWide's `inst->Arg(0).Resolve() ==
+			// m_active_mask` check -- here, "the same Inst*" is "the same compiled slot". If
+			// this Select's own predicate is the ReadFirstLane mask currently in scope, the
+			// lane(s) being read are definitionally inside that mask, so the predicate must
+			// be true for them -- take the true branch without evaluating the predicate.
+			if (m_active_mask_slot != kInvalidSlot && op.operands[0] == m_active_mask_slot) {
+				return Operand(clean, op, 1, result);
+			}
+			// Otherwise mirrors EvaluateInst's Select case: the predicate is resolved
+			// against the clean pass rather than this pass's own results -- matching
+			// `m_clean_evaluator != nullptr ? *m_clean_evaluator : *this` -- and only the
+			// branch the predicate actually selects is required; the other is never touched,
+			// exactly like the interpreter's lazy Arg() call on only one branch.
+			uint64_t predicate = 0;
+			if (!Operand(true, op, 0, predicate)) {
+				return false;
+			}
+			return Operand(clean, op, predicate != 0u ? 1u : 2u, result);
+		}
+		case CompiledOpKind::Generic: return Generic(clean, op, result);
+	}
+	return false;
+}
+
+bool SrtExecution::RawRead(bool clean, const CompiledOp& op, uint64_t& result) {
+	uint64_t low    = 0;
+	uint64_t high   = 0;
+	uint64_t offset = 0;
+	if (!Operand(clean, op, 0, low) || !Operand(clean, op, 1, high) ||
+	    !Operand(clean, op, 2, offset)) {
+		return false;
+	}
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(op.immediate);
+	uint64_t   address   = 0;
+	if (op.is_const_buffer_read) {
+		uint64_t records = 0;
+		uint64_t word3   = 0;
+		if (!Operand(clean, op, 3, records) || !Operand(clean, op, 4, word3)) {
+			return false;
+		}
+		if (immediate < 0) {
+			return false;
+		}
+		const auto byte_offset =
+		    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
+		const auto aligned = byte_offset & ~uint64_t {3};
+		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		const auto size    = stride == 0u
+		                         ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                         : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+			return false;
+		}
+		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+	} else {
+		const auto relative = (immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+			return false;
+		}
+	}
+	const auto read = clean ? m_clean_read : m_raw_read;
+	uint32_t   word = 0;
+	if (read != nullptr) {
+		if (!read(m_userdata, address, &word)) {
+			return false;
+		}
+	} else if (clean) {
+		return false;
+	} else {
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	}
+	result = word;
+	return true;
+}
+
+bool SrtExecution::Generic(bool clean, const CompiledOp& op, uint64_t& result) {
+	std::array<uint64_t, 4> v {};
+	for (uint8_t index = 0; index < op.num_operands; index++) {
+		if (!Operand(clean, op, index, v[index])) {
+			return false;
+		}
+	}
+	const auto a = v[0];
+	const auto b = v[1];
+	const auto c = v[2];
+	const auto d = v[3];
+	switch (op.opcode) {
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32: result = a; return true;
+		case ValueOpcode::CompositeConstructU64:
+			result = static_cast<uint32_t>(a) |
+			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			return true;
+		case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); return true;
+		case ValueOpcode::IAdd64: result = a + b; return true;
+		case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); return true;
+		case ValueOpcode::ISub64: result = a - b; return true;
+		case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); return true;
+		case ValueOpcode::IMul64: result = a * b; return true;
+		case ValueOpcode::UMin32:
+			result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+			return true;
+		case ValueOpcode::ConvertF32U32:
+			result = Float32Bits(static_cast<float>(static_cast<uint32_t>(a)));
+			return true;
+		case ValueOpcode::ConvertU32F32: {
+			const auto value = Float32(a);
+			if (!std::isfinite(value) || value < 0.0f ||
+			    static_cast<double>(value) > UINT32_MAX) {
+				return false;
+			}
+			result = static_cast<uint32_t>(value);
+			return true;
+		}
+		case ValueOpcode::FPMul32: result = Float32Bits(Float32(a) * Float32(b)); return true;
+		case ValueOpcode::FPTrunc32: result = Float32Bits(std::trunc(Float32(a))); return true;
+		case ValueOpcode::FPIsNan32: result = std::isnan(Float32(a)); return true;
+		case ValueOpcode::FPOrdLessThanEqual32: result = Float32(a) <= Float32(b); return true;
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+			result = Float32(a) >= Float32(b);
+			return true;
+		case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); return true;
+		case ValueOpcode::BitwiseAnd64: result = a & b; return true;
+		case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); return true;
+		case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); return true;
+		case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); return true;
+		case ValueOpcode::ShiftLeftLogical32:
+			result = static_cast<uint32_t>(a) << (b & 31u);
+			return true;
+		case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); return true;
+		case ValueOpcode::ShiftRightLogical32:
+			result = static_cast<uint32_t>(a) >> (b & 31u);
+			return true;
+		case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); return true;
+		case ValueOpcode::ShiftRightArithmetic32:
+			result = static_cast<uint32_t>(
+			    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
+			return true;
+		case ValueOpcode::ShiftRightArithmetic64:
+			result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
+			return true;
+		case ValueOpcode::BitFieldUExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			const auto mask = width == 32u  ? UINT32_MAX
+			                  : width == 0u ? 0u
+			                                : (uint32_t {1} << width) - 1u;
+			result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+			return true;
+		}
+		case ValueOpcode::BitFieldSExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = 0;
+				return true;
+			}
+			const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
+			auto       bits = (static_cast<uint32_t>(a) >> offset) & mask;
+			if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
+				bits |= ~mask;
+			}
+			result = bits;
+			return true;
+		}
+		case ValueOpcode::BitFieldInsert: {
+			const auto offset = static_cast<uint32_t>(c);
+			const auto width  = static_cast<uint32_t>(d);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = static_cast<uint32_t>(a);
+				return true;
+			}
+			const auto mask =
+			    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+			result = (static_cast<uint32_t>(a) & ~mask) |
+			         ((static_cast<uint32_t>(b) << offset) & mask);
+			return true;
+		}
+		case ValueOpcode::IEqual32:
+			result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::INotEqual32:
+			result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::ULessThan32:
+			result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::UGreaterThan32:
+			result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::SGreaterThanEqual32:
+			result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+			         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+			return true;
+		case ValueOpcode::LogicalAnd: result = (a != 0u) && (b != 0u); return true;
+		case ValueOpcode::LogicalOr: result = (a != 0u) || (b != 0u); return true;
+		case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); return true;
+		case ValueOpcode::LogicalNot: result = a == 0u; return true;
+		default: return false;
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

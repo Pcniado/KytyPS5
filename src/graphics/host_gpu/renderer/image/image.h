@@ -155,7 +155,9 @@ public:
 	// unsubmitted recording (i.e. many draws to the same bound render target) skip the
 	// synchronous GPU readback after the first one -- a real re-clear in a later recording still
 	// gets caught because the tick will have advanced by then.
-	uint64_t         dcc_clear_checked_tick = UINT64_MAX;
+	uint64_t         dcc_clear_checked_tick  = UINT64_MAX;
+	uint32_t         dcc_clear_checked_first = 0;
+	uint32_t         dcc_clear_checked_count = 0;
 
 private:
 	friend struct ImageTestAccess;

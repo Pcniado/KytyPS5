@@ -2498,8 +2498,8 @@ public:
         const auto immediate_tick = gpu_scheduler.CurrentTick();
         const auto immediate_result =
             processor->Process(immediate_execution, immediate);
-        const bool immediate_split_once =
-            gpu_scheduler.CurrentTick() == immediate_tick + 1;
+        const bool immediate_batched =
+            gpu_scheduler.CurrentTick() == immediate_tick;
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
         Pm4Execution gds_execution;
@@ -2513,8 +2513,8 @@ public:
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+        const bool interrupt_batched =
+            gpu_scheduler.CurrentTick() == interrupt_tick;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -2526,9 +2526,9 @@ public:
 
         release_mem_submission_counts =
             immediate_result == Pm4ProcessResult::Complete &&
-            immediate_split_once && gds_result == Pm4ProcessResult::Complete &&
+            immediate_batched && gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            interrupt_batched &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
@@ -2540,8 +2540,8 @@ public:
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required split/readback or retained a "
-              "redundant GPU wait");
+              "RELEASE_MEM lost its required readback, retained a redundant GPU "
+              "wait, or split a batchable fence write");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;

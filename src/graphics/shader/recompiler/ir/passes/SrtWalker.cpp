@@ -1146,19 +1146,7 @@ bool EvaluateRuntimeSourcesCompiled(const ResourcePlan& program, std::span<const
 	// above: exactly one top-level call in flight per thread at a time.
 	thread_local SrtExecutorScratch g_clean_scratch;
 	thread_local SrtExecutorScratch g_raw_scratch;
-	// compiled.needs_clean_pass is fixed at compile time from the exact same data (clean_flat_slots/
-	// control_flow) that produced every op's srt_slot_clean flag, so when it's false no op in this
-	// program can ever read g_clean_scratch -- running the clean pass would just compute results
-	// nothing looks at. Skipping it also means the raw pass must not be handed a stale
-	// g_clean_scratch left over from a previous, unrelated program's clean pass.
-	const auto* clean_scratch = compiled.needs_clean_pass ? &g_clean_scratch : nullptr;
-	if (compiled.needs_clean_pass) {
-		ExecuteSrtProgram(compiled, runtime.read_specialization_memory, runtime.userdata,
-		                 runtime.user_data, runtime.shader_base, g_clean_scratch, kInvalidSlot,
-		                 nullptr);
-	}
-	ExecuteSrtProgram(compiled, runtime.read_memory, runtime.userdata, runtime.user_data,
-	                 runtime.shader_base, g_raw_scratch, kInvalidSlot, clean_scratch);
+	SrtExecution                    execution(compiled, runtime, g_clean_scratch, g_raw_scratch);
 
 	std::vector<uint8_t> active;
 	if (evaluate_flat) {
@@ -1183,17 +1171,12 @@ bool EvaluateRuntimeSourcesCompiled(const ResourcePlan& program, std::span<const
 			for (const auto source: block.sources) {
 				active[source] = 1u;
 			}
-			uint32_t   condition       = 0;
-			bool       have_condition = false;
+			uint64_t   condition = 0;
 			const auto cond_slot = compiled.control_flow_condition_slots.at(index);
 			// A missing clean reader must never fall through to the raw pass's memory reads --
 			// matches the interpreted path's check above.
 			if (cond_slot != kInvalidSlot && runtime.read_specialization_memory != nullptr &&
-			    g_clean_scratch.computed[cond_slot] != 0u) {
-				condition      = static_cast<uint32_t>(g_clean_scratch.results[cond_slot]);
-				have_condition = true;
-			}
-			if (have_condition) {
+			    execution.Clean(cond_slot, condition)) {
 				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 			} else {
 				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1212,11 +1195,12 @@ bool EvaluateRuntimeSourcesCompiled(const ResourcePlan& program, std::span<const
 		if (!evaluate_flat || active[source_index]) {
 			const auto& slots = compiled.descriptor_source_slots.at(source_index);
 			for (uint32_t index = 0; index < source->dword_count; index++) {
-				const auto slot = slots[index];
-				if (slot == kInvalidSlot || g_raw_scratch.computed[slot] == 0u) {
+				const auto slot  = slots[index];
+				uint64_t   dword = 0;
+				if (slot == kInvalidSlot || !execution.Raw(slot, dword)) {
 					return false;
 				}
-				value.dwords[index] = static_cast<uint32_t>(g_raw_scratch.results[slot]);
+				value.dwords[index] = static_cast<uint32_t>(dword);
 			}
 		}
 		evaluated.push_back(value);
@@ -1228,13 +1212,13 @@ bool EvaluateRuntimeSourcesCompiled(const ResourcePlan& program, std::span<const
 			const auto& read  = program.srt_reads[i];
 			const bool  clean = read.flat_offset < clean_flat_slots.size() &&
 			                   clean_flat_slots[read.flat_offset] != 0u;
-			const auto& scratch = clean ? g_clean_scratch : g_raw_scratch;
-			const auto  slot    = compiled.srt_read_slots.at(i);
+			const auto slot  = compiled.srt_read_slots.at(i);
+			uint64_t   value = 0;
 			if (read.flat_offset >= flattened.size() || slot == kInvalidSlot ||
-			    scratch.computed[slot] == 0u) {
+			    !(clean ? execution.Clean(slot, value) : execution.Raw(slot, value))) {
 				return false;
 			}
-			flattened[read.flat_offset] = static_cast<uint32_t>(scratch.results[slot]);
+			flattened[read.flat_offset] = static_cast<uint32_t>(value);
 		}
 	}
 	results        = std::move(evaluated);

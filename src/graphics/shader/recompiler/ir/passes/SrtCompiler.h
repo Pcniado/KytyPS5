@@ -5,13 +5,14 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // A compiled, topologically-ordered form of a ResourcePlan's reachable SRT expression graph --
 // see SrtCompiler.cpp's file comment for the full design rationale. Built once per unique shader
-// (in ExtractResourcePlan), evaluated by ExecuteSrtProgram() on every draw instead of recursively
+// (in ExtractResourcePlan), evaluated by SrtExecution on every draw instead of recursively
 // re-walking the Inst graph through Evaluator::EvaluateInst's switch every time.
 enum class CompiledOpKind : uint8_t {
 	// Never produces a value. Used for: a Phi that survived ExtractResourcePlan's invariant
@@ -45,9 +46,9 @@ enum class CompiledOpKind : uint8_t {
 	ReadConst,
 	RawRead,
 	// SelectU32/SelectU1/SelectF32: operand[0] is the predicate, operand[1]/[2] the true/false
-	// branches. See ExecutePass's case for why this needs its own kind instead of folding into
-	// Generic -- the predicate is resolved against the clean pass (when available) rather than
-	// this pass's own results, and only the branch it actually selects needs to be computed.
+	// branches. See SrtExecution::Evaluate's case for why this needs its own kind instead of
+	// folding into Generic -- the predicate is resolved against the clean pass rather than this
+	// pass's own results, and only the branch it actually selects needs to be computed.
 	Select,
 };
 
@@ -77,14 +78,6 @@ struct CompiledSrtProgram {
 	// Compiled slot for each control_flow[i].condition, parallel to ResourcePlan::control_flow.
 	// kInvalidSlot when that block's condition is empty (unconditional edge).
 	std::vector<uint32_t> control_flow_condition_slots;
-	// True if some ReadConst op in `ops` has srt_slot_clean set, or the program has control flow
-	// whose branch condition must be resolved through the clean pass -- both are compile-time-fixed
-	// properties of ResourcePlan::clean_flat_slots/control_flow, so this is computed once here
-	// rather than re-checked on every evaluation. When false, no op anywhere in this program can
-	// ever consult a clean-pass scratch buffer, so the caller can skip running the clean pass
-	// entirely instead of computing results nothing will read -- see EvaluateRuntimeSourcesCompiled
-	// in SrtWalker.cpp.
-	bool needs_clean_pass = false;
 };
 
 // Builds a CompiledSrtProgram covering every Inst reachable from program.descriptor_sources,
@@ -92,24 +85,49 @@ struct CompiledSrtProgram {
 // builds the final, stable Inst graph for a shader.
 CompiledSrtProgram CompileSrtProgram(const ResourcePlan& program);
 
-// Scratch buffers for ExecuteSrtProgram(), reused across calls the same way SrtWalker's Evaluator
+// Scratch buffers for SrtExecution, reused across calls the same way SrtWalker's Evaluator
 // caches are (grows once to the largest program seen, never reallocates after).
 struct SrtExecutorScratch {
 	std::vector<uint64_t> results;
 	std::vector<uint8_t>  computed;
 };
 
-// Evaluates every op in `compiled` in order using `read_memory` for RawRead ops, writing results
-// into `scratch.results`/`scratch.computed` (resized as needed). `active_mask_slot` is
-// kInvalidSlot for a top-level pass, or the compiled slot of a ReadFirstLane's mask operand when
-// recursively evaluating that node's scoped subtree (see SrtCompiler.cpp for why this needs a
-// fresh, non-shared scratch per nesting level, matching Evaluator's per-ReadFirstLane behaviour).
-// `clean_scratch` is the finished clean pass's own scratch, consulted for any ReadConst op whose
-// SRT slot is statically clean -- pass nullptr for the clean pass itself.
-void ExecuteSrtProgram(const CompiledSrtProgram& compiled, SrtMemoryReader read_memory,
-                       void* userdata, std::span<const uint32_t> user_data, uint64_t shader_base,
-                       SrtExecutorScratch& scratch, uint32_t active_mask_slot,
-                       const SrtExecutorScratch* clean_scratch);
+class SrtExecution {
+public:
+	SrtExecution(const CompiledSrtProgram& compiled, const SrtRuntime& runtime,
+	             SrtExecutorScratch& clean_scratch, SrtExecutorScratch& raw_scratch);
+
+	bool Clean(uint32_t slot, uint64_t& value) { return Demand(true, slot, value); }
+	bool Raw(uint32_t slot, uint64_t& value) { return Demand(false, slot, value); }
+
+private:
+	SrtExecution(const CompiledSrtProgram& compiled, SrtMemoryReader clean_read,
+	             SrtMemoryReader raw_read, void* userdata, std::span<const uint32_t> user_data,
+	             uint64_t shader_base, SrtExecutorScratch& clean, SrtExecutorScratch& raw,
+	             uint32_t active_mask_slot);
+
+	static constexpr uint8_t Untried  = 0;
+	static constexpr uint8_t Computed = 1;
+	static constexpr uint8_t Failed   = 2;
+	static constexpr uint8_t Visiting = 3;
+
+	void Reset(SrtExecutorScratch& scratch) const;
+	bool Demand(bool clean, uint32_t slot, uint64_t& value);
+	bool Operand(bool clean, const CompiledOp& op, uint32_t index, uint64_t& value);
+	bool Evaluate(bool clean, uint32_t i, uint64_t& result);
+	bool RawRead(bool clean, const CompiledOp& op, uint64_t& result);
+	bool Generic(bool clean, const CompiledOp& op, uint64_t& result);
+
+	const CompiledSrtProgram& m_compiled;
+	SrtMemoryReader           m_clean_read;
+	SrtMemoryReader           m_raw_read;
+	void*                     m_userdata;
+	std::span<const uint32_t> m_user_data;
+	uint64_t                  m_shader_base;
+	SrtExecutorScratch&       m_clean;
+	SrtExecutorScratch&       m_raw;
+	uint32_t                  m_active_mask_slot;
+};
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
