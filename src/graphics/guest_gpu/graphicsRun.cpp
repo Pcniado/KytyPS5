@@ -1121,8 +1121,17 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
+	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+	if ((mode & DispatchInitiatorUseThreadDimensions) == 0) {
+		m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+		CheckBuffer();
+		m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr,
+		                                                mode);
+		return;
+	}
+
+	auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
 

@@ -399,4 +399,78 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+                                      uint64_t args_address, uint32_t mode) {
+	EXIT_IF(buffer.IsInvalid());
+	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& ctx    = buffer.GetRegisters();
+	auto& sh_ctx = buffer.GetShaders();
+
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
+	                    static_cast<uint32_t>(args_address), static_cast<uint32_t>(args_address >> 32u),
+	                    0, mode, sh_ctx.GetCs().cs_regs.data_addr);
+
+	Common::LockGuard lock(m_context.GetMutex());
+	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
+		return;
+	}
+
+	const auto& cs_regs = sh_ctx.GetCs();
+	const auto& sh_regs = ctx.GetShaderRegisters();
+
+	ShaderComputeInputInfo input_info {};
+	const auto             compute_program =
+	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program) {
+		ResetBindings();
+		return;
+	}
+	const auto& program = *input_info.stage.program;
+
+	constexpr uint64_t ArgsSize = 3 * sizeof(uint32_t);
+	auto [args_buffer, args_offset] =
+	    m_context.GetBufferCache().ObtainBuffer(args_address, ArgsSize, false, false);
+	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+
+	buffer.EndRendering();
+	auto& pipeline =
+	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto bindings = PrepareBindings(input_info.stage);
+	FindBuffers(bindings);
+	if (program.info.uses_dma) {
+		m_context.PrepareBda();
+	}
+	RebindImages(bindings);
+	RebindBuffers(bindings);
+
+	auto              vk_buffer        = buffer.Handle();
+	PreparedBindings* descriptor_stage = &bindings;
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	               std::span {&descriptor_stage, 1u});
+	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
+	has_storage_writes =
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& image) {
+		                return image.written &&
+		                       image.resource_class ==
+		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
+	                }) ||
+	    has_storage_writes;
+	if (has_storage_writes) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	vk::MemoryBarrier args_barrier {};
+	args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	args_barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, vk::DependencyFlags {}, 1,
+	                          &args_barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ResetBindings();
+}
+
 } // namespace Libs::Graphics
