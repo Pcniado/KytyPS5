@@ -144,16 +144,28 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, uint32_t* value) {
 	// A 4-byte read spanning two pages only happens from a deliberately misaligned address -- SRT/
 	// descriptor reads are always naturally 4-byte aligned in practice -- so just skip the cache
 	// for that vanishingly rare case rather than reason about two pages' verdicts at once.
+	bool dirty = false;
 	if (cache == nullptr || page != last_page) {
-		return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+		if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value))) {
+			return true;
+		}
+	} else if (cache->Find(page, dirty)) {
+		if (!dirty) {
+			return Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+		}
+	} else {
+		const bool ok =
+		    Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+		cache->Insert(page, !ok);
+		if (ok) {
+			return true;
+		}
 	}
-	bool cached_dirty = false;
-	if (cache->Find(page, cached_dirty)) {
-		return !cached_dirty && Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value))) {
+		return false;
 	}
-	const bool ok = Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
-	cache->Insert(page, !ok);
-	return ok;
+	std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
