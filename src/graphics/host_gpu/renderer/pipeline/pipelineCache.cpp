@@ -32,11 +32,16 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+bool ShaderFailureNonFatal() {
+	return true;
+}
 
 namespace {
 
@@ -333,6 +338,9 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if (unsupported.contains(lookup_key)) {
+			return ShaderProgram {};
+		}
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -347,8 +355,19 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+			                                                 resources, specialization)) {
+				if (!ShaderFailureNonFatal()) {
+					EXIT("shader resource materialization failed\n");
+				}
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1) < 16) {
+					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+					     ": resource materialization failed\n",
+					     static_cast<uint32_t>(stage), params.hash);
+				}
+				return ShaderProgram {};
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -404,11 +423,27 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.wave_size = input_info.wave_size;
 		}
+		options.non_fatal = ShaderFailureNonFatal();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.unsupported) {
+			unsupported.insert(lookup_key);
+			return ShaderProgram {};
+		}
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                                 specialization)) {
+				if (!ShaderFailureNonFatal()) {
+					EXIT("shader resource materialization failed\n");
+				}
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1) < 16) {
+					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+					     ": resource materialization failed on first use\n",
+					     static_cast<uint32_t>(stage), params.hash);
+				}
+				return ShaderProgram {};
+			}
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
 		entry->second.permutations.push_back(CompilePermutation(
@@ -446,6 +481,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -627,7 +663,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
+			if (!ShaderFailureNonFatal()) {
+				EXIT("unsupported tessellation programs\n");
+			}
+			return {};
+		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
