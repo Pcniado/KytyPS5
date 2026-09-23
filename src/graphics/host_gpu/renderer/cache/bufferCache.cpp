@@ -69,7 +69,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -92,7 +93,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, LruClock());
 	}
 }
 
@@ -109,6 +110,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto capacity = m_download_buffer.Size();
+	bool       any      = false;
+	for (uint64_t offset = 0; offset < size; offset += capacity) {
+		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+	}
+	return any;
+}
+
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -231,6 +241,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -250,6 +261,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			// Must be CurrentTick(): DownloadBufferMemory queues its copy-out command into
+			// whatever recording is currently open, so that recording has to actually be
+			// submitted and complete before the staging buffer it wrote into can be read back.
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
@@ -484,9 +498,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: staging reservation failed for guest image\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
+		std::memset(staging, 0, static_cast<size_t>(size));
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
@@ -578,30 +595,33 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+uint64_t BufferCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
 void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
+	KYTY_PROFILER_FUNCTION();
+	m_gc_tick++;
+	const auto clock = LruClock();
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (buffer.CpuAddress() == 0) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
-			return false;
-		}
 		if (dirty) {
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
@@ -615,7 +635,10 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	// Publish all queued downloads before releasing their tracked pages and owners.
+	// Publish all queued downloads before releasing their tracked pages and owners. Must be
+	// CurrentTick(): DownloadBufferMemory above queued copy-out commands into the currently open
+	// recording, so that recording has to actually submit and complete -- see ReadMemory's wait
+	// for why waiting on an older per-buffer tick here would skip that entirely.
 	const auto completion_tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);

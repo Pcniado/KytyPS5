@@ -1,6 +1,9 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <cinttypes>
+
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -44,14 +47,27 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	// Profiling-only zone: this is the actual CPU-blocks-on-GPU stall. Everything above this
+	// point is a fast non-blocking check; only reaching here means the GPU genuinely hasn't
+	// caught up yet.
+	KYTY_PROFILER_BLOCK("MasterSemaphore::Wait (blocked on GPU)");
+
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			DumpDeviceLossDiagnostics(m_graphics);
+		}
+		EXIT("MasterSemaphore: wait for tick %" PRIu64 " failed: %s (gpu tick %" PRIu64 ")\n", tick,
+		     vk::to_string(result).c_str(), m_gpu_tick.load(std::memory_order_acquire));
+	}
 	Refresh();
+
+	KYTY_PROFILER_END_BLOCK;
 }
 
 } // namespace Libs::Graphics

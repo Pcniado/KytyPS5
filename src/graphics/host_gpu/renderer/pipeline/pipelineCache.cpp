@@ -1,11 +1,13 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -30,11 +32,16 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+bool ShaderFailureNonFatal() {
+	return true;
+}
 
 namespace {
 
@@ -282,6 +289,9 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if (unsupported.contains(lookup_key)) {
+			return ShaderProgram {};
+		}
 		auto                                         entry = programs.find(lookup_key);
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
@@ -347,7 +357,12 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.wave_size = input_info.wave_size;
 		}
+		options.non_fatal = ShaderFailureNonFatal();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.unsupported) {
+			unsupported.insert(lookup_key);
+			return ShaderProgram {};
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -390,6 +405,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -571,7 +587,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
+			if (!ShaderFailureNonFatal()) {
+				EXIT("unsupported tessellation programs\n");
+			}
+			return {};
+		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}

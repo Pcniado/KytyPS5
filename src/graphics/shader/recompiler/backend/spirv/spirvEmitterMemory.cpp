@@ -277,6 +277,8 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
+void     StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
+                           uint32_t index, uint32_t data);
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
@@ -313,7 +315,12 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer);
+	if (resource.coherent) {
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
+		                              spv::MemoryAccessVolatileMask);
+	} else {
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer);
+	}
 	return value;
 }
 
@@ -501,16 +508,18 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		ctx.state.builder.AddFunction(spv::OpStore,
-		                              EmitMemoryElementPointer(ctx.state, resource, index), data);
-	});
+	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	                [&]() { StoreWordInBounds(ctx, resource, index, data); });
 }
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data);
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if (resource.coherent) {
+		ctx.state.builder.AddFunction(spv::OpStore, pointer, data, spv::MemoryAccessVolatileMask);
+	} else {
+		ctx.state.builder.AddFunction(spv::OpStore, pointer, data);
+	}
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {

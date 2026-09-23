@@ -1,6 +1,8 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -99,9 +101,15 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		if (m_failed) {
+			return;
+		}
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
+				if (m_failed) {
+					return;
+				}
 			}
 		}
 		LinkImageAliases();
@@ -161,14 +169,27 @@ private:
 		std::array<const Inst*, 8> reads {};
 	};
 
-	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
+	void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (Frontend::TranslationNonFatal()) {
+			if (!m_failed) {
+				LOGF("%s\n", message.c_str());
+			}
+			m_failed = true;
+			return;
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
 
+	mutable bool m_failed = false;
+
+public:
+	[[nodiscard]] bool Failed() const { return m_failed; }
+
+private:
 	Value LowerDescriptorPhi(Value value, const Block* use) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
@@ -955,8 +976,10 @@ private:
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+bool TrackResources(Program& program) {
+	Tracker tracker(program);
+	tracker.Run();
+	return !tracker.Failed();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
