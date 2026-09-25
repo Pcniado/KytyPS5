@@ -373,13 +373,13 @@ void EmitMemoryOffsets(EmitterState& state);
 uint32_t LdsDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
-	IR::ResourceKind kind             = IR::ResourceKind::None;
-	uint32_t         object_pointer   = 0;
-	uint32_t         length           = 0;
-	uint32_t         index_offset     = 0;
-	uint32_t         byte_offset      = 0;
-	bool             add_index_offset = false;
-	bool             coherent         = false;
+	IR::ResourceKind      kind             = IR::ResourceKind::None;
+	uint32_t              object_pointer   = 0;
+	uint32_t              length           = 0;
+	uint32_t              index_offset     = 0;
+	uint32_t              byte_offset      = 0;
+	bool                  add_index_offset = false;
+	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
