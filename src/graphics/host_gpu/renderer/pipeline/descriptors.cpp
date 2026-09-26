@@ -630,6 +630,20 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	static uint32_t oversized_texture_reports = 0;
+	if (oversized_texture_reports < 24) {
+		const auto backed_size = LibKernel::Memory::ClampRangeSize(address, size.size);
+		if (backed_size != size.size) {
+			++oversized_texture_reports;
+			std::printf("Texture backing diagnostic: addr=%016" PRIx64 " size=%x backed=%" PRIx64
+			            " extent=%ux%ux%u base=%u last=%u max=%u tile=%u format=%u r128=%d "
+			            "words=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            address, size.size, backed_size, width, height, depth, base_level, last_level,
+			            max_mip, static_cast<uint32_t>(tile), static_cast<uint32_t>(format), resource.r128,
+			            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+		}
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
@@ -805,6 +819,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		if (size == 0) {
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }

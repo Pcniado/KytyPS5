@@ -87,6 +87,10 @@ ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }
 
+StubShaderMode GetStubShaderMode() {
+	return g_config->stub_shader_mode;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }

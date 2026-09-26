@@ -6845,6 +6845,51 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestPrivateApertureFlatAccess() {
+  const uint32_t shader[] = {
+      0xbe8004edu, // s_mov_b64 s[0:1], private_base
+      EncodeVop1(0x01, 0, 128),
+      EncodeVop1(0x01, 1, 1), // v1 = high dword of private_base
+      EncodeVop1(0x01, 2, 170),
+      EncodeFlat0(0x1c, 0, 4), EncodeFlat1(0, 0x7d, 2, 0),
+      EncodeFlat0(0x0c, 0, 4), EncodeFlat1(3, 0x7d, 0, 0),
+      EncodeFlat0(0x1c, 0, 8), EncodeFlat1(0, 0x7d, 3, 0),
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  ShaderComputeInputInfo compute = *options.input_info.compute;
+  compute.scratch_size_dwords = 4;
+  compute.lds_size_dwords = 4;
+  options.input_info.compute = &compute;
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("private_base") != std::string::npos,
+        "private aperture source was not decoded");
+  Check(!result.program.info.uses_dma && result.program.scratch_dwords == 4,
+        "private FLAT accesses were routed into global guest memory");
+  Check(!result.program.memory_info.empty() &&
+            std::all_of(result.program.memory_info.begin(), result.program.memory_info.end(),
+                        [](const auto& memory) {
+                          return memory.kind == ShaderRecompiler::IR::ResourceKind::Scratch;
+                        }),
+        "private FLAT load/store did not use per-invocation scratch");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  std::vector<uint32_t> shared(std::begin(shader), std::end(shader));
+  shared[0] = 0xbe8004ebu; // s_mov_b64 s[0:1], shared_base
+  const auto shared_result = RecompileForTest(shared, options);
+  Check(shared_result.decoded_dump.find("shared_base") != std::string::npos &&
+            !shared_result.program.info.uses_dma,
+        "shared aperture was routed into global guest memory");
+  Check(!shared_result.program.memory_info.empty() &&
+            std::all_of(shared_result.program.memory_info.begin(),
+                        shared_result.program.memory_info.end(), [](const auto& memory) {
+                          return memory.kind == ShaderRecompiler::IR::ResourceKind::Lds;
+                        }),
+        "shared FLAT load/store did not use workgroup LDS");
+  CheckSpirvBinaryValidates(shared_result.spirv);
+}
+
 void TestNewShaderRecompilerFlatSignedLoadTranslation() {
   const uint32_t shader[] = {
       EncodeFlat0(0x09, 0, 4),
@@ -13564,6 +13609,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestPrivateApertureFlatAccess();
   TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

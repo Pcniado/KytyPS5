@@ -287,7 +287,10 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// SDL has already applied a remap; later events use its updated logical buttons.
+	if (f.remapped) {
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -305,15 +308,23 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
+		auto* pad = SDL_GetGamepadFromID(f.id);
+		if (pad == nullptr) {
+			pad = SDL_OpenGamepad(f.id);
+		}
+		if (pad == nullptr) {
+			// A device may disappear before its queued connection event is processed.
+			LOGF("Controller %d could not be opened: %s\n", f.id, SDL_GetError());
+			return;
+		}
+		Controller::Connect(f.id);
 	}
 
 	if (f.removed) {
 		Controller::Disconnect(f.id);
-		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
+		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
+			SDL_CloseGamepad(pad);
+		}
 	}
 
 	if (f.down || f.up) {

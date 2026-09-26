@@ -66,6 +66,8 @@ static void PrintUsage() {
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
+	::printf("  --stub-shaders <mode>                Replace shaders with basic stub shaders.\n"
+	         "                                       Modes: None, All, Compute, Graphics, Pixel, Vertex.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
@@ -197,6 +199,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 #endif
+
+		if (arg == "--stub-shaders" || arg == "--basic-shaders") {
+			std::string val;
+			if (i + 1 < argc && argv[i + 1][0] != '-') {
+				val = argv[++i];
+				if (val == "true" || val == "1") {
+					options.config.stub_shader_mode = Config::StubShaderMode::All;
+				} else if (val == "false" || val == "0") {
+					options.config.stub_shader_mode = Config::StubShaderMode::None;
+				} else if (!ParseEnum(val, options.config.stub_shader_mode)) {
+					::printf("invalid stub shader mode: %s (expected None, All, Compute, Graphics, Pixel, Vertex)\n", val.c_str());
+					return false;
+				}
+			} else {
+				options.config.stub_shader_mode = Config::StubShaderMode::All;
+			}
+			continue;
+		}
 
 		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");

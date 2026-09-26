@@ -1002,7 +1002,8 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 	return transfer;
 }
 
-void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset,
+                              uint32_t first_level, uint64_t source_size) {
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1025,9 +1026,17 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
-		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
+		if (source_size == 0) source_size = info.data.size;
+		if (first_level != 0) {
+			// Tile records and copy records have the same mip-major order for 2D textures.
+			EXIT_IF(info.resources.layers != 1 || info.IsVolume() ||
+			        transfer.tiles.size() != transfer.regions.size());
+			transfer.regions.erase(transfer.regions.begin(), transfer.regions.begin() + first_level);
+			transfer.tiles.erase(transfer.tiles.begin(), transfer.tiles.begin() + first_level);
+		}
+		TileManager::Result linear {source.Handle(), source_offset, source_size};
 		if (!transfer.tiles.empty()) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			linear = m_tiler.Detile(source.Handle(), source_offset, source_size,
 			                        transfer.LinearSize(), transfer.tiles);
 		}
 		if (transfer.swap_bgra16) {
@@ -1089,7 +1098,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
-void TextureCache::InitializeImage(ImageId id) {
+void TextureCache::InitializeImage(ImageId id, uint32_t first_level) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
@@ -1106,12 +1115,27 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		uint64_t source_size = image.info.data.size;
+		if (first_level != 0 && image.info.IsTiled() && !image.info.IsVolume() &&
+		    image.info.resources.layers == 1 && !image.info.IsDepth() && !image.depth_id) {
+			// Native tiled mip chains are reversed. A streamed texture can expose only
+			// the lower-resolution prefix, with MIN_LOD excluding the absent larger mips.
+			source_size = 0;
+			for (uint32_t level = first_level; level < image.info.resources.levels; ++level) {
+				const auto& mip = image.info.mip_layout[level];
+				source_size = std::max(source_size, mip.offset + mip.size);
+			}
+			EXIT_IF(source_size == 0 || source_size > image.info.data.size);
+		} else {
+			first_level = 0;
+		}
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, source_size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		UploadImage(image, *source, source_offset, first_level, source_size);
+		image.uploaded_first_level = first_level;
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1207,7 +1231,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id) {
+void TextureCache::RefreshImage(ImageId id, uint32_t first_level) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1233,7 +1257,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
-	InitializeImage(id);
+	InitializeImage(id, first_level);
 }
 
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
@@ -1409,7 +1433,13 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		image.MarkGpuModified();
 	}
 	if (!image.info.data.Empty()) {
-		RefreshImage(id);
+		const auto first_level = desc.type == BindingType::Texture
+		                             ? desc.view_info.base_level + desc.view_info.min_lod / 256u
+		                             : 0u;
+		if (first_level < image.uploaded_first_level && !image.IsGpuModified()) {
+			image.MarkBufferModified();
+		}
+		RefreshImage(id, first_level);
 		if (image.info.HasStencil() &&
 		    desc.info.data.address >= image.info.stencil.address &&
 		    desc.info.data.End() <= image.info.stencil.End()) {

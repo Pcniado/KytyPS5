@@ -47,6 +47,7 @@ struct ImageBinding {
 
 class Image final {
 public:
+	uint32_t uploaded_first_level = UINT32_MAX;
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);

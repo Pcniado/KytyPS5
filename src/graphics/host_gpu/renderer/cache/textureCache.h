@@ -138,14 +138,15 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	void                        RefreshImage(ImageId id, uint32_t first_level = 0);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
+	void                        InitializeImage(ImageId id, uint32_t first_level = 0);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset,
+	                 uint32_t first_level = 0, uint64_t source_size = 0);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

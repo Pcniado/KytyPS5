@@ -83,6 +83,17 @@ static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) 
 }
 
 static bool IsGuestRangeCommitted(uint64_t addr, uint64_t size) {
+	if (size == 0) {
+		return true;
+	}
+	if (!IsValidGuestRange(addr, size)) {
+		return false;
+	}
+	// Guest mappings already record commitment across adjacent ranges. Avoid a
+	// host query for each small archive read; retain it for untracked module memory.
+	if (LibKernel::Memory::ClampRangeSize(addr, size) == size) {
+		return true;
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uint64_t checked = 0;
 	while (checked < size) {
@@ -1721,6 +1732,7 @@ private:
 			uint32_t error_offset     = 0;
 			const auto submit_result =
 			    ExecuteCommandBufferState(submission.state, &execution_result, &error_offset);
+
 			if (submit_result != OK && execution_result == OK) {
 				execution_result = submit_result;
 			}

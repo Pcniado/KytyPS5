@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/MemoryAperture.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -104,6 +105,7 @@ public:
 		if (m_failed) {
 			return;
 		}
+		LowerApertureAddresses();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -148,6 +150,57 @@ public:
 	}
 
 private:
+	void LowerApertureAddresses() {
+		for (auto* block: m_program.blocks) {
+			for (auto it = block->begin(); it != block->end(); ++it) {
+				auto& inst = *it;
+				if (AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::None ||
+				    inst.NumArgs() < 3) {
+					continue;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					continue;
+				}
+				auto& memory = m_program.memory_info[flags.index];
+				const auto high = inst.Arg(2).Resolve();
+				if (memory.kind != ResourceKind::Flat || !memory.address_is_full ||
+				    !high.IsImmediate() || high.GetType() != Type::U32 ||
+				    (high.U32() != PrivateApertureHigh && high.U32() != SharedApertureHigh)) {
+					continue;
+				}
+				if (high.U32() == SharedApertureHigh) {
+					const auto address = inst.Arg(1);
+					const auto active = inst.Arg(inst.NumArgs() - 1);
+					const auto access = AddressOpcodeInfoOf(inst.GetOpcode());
+					const bool write = access.access == AddressAccess::Write;
+					const auto data = write ? inst.Arg(inst.NumArgs() - 2) : Value {};
+					ValueOpcode opcode;
+					switch (access.data_bits) {
+						case 8u: opcode = write ? ValueOpcode::WriteSharedU8 : ValueOpcode::LoadSharedU8; break;
+						case 16u: opcode = write ? ValueOpcode::WriteSharedU16 : ValueOpcode::LoadSharedU16; break;
+						case 32u: opcode = write ? ValueOpcode::WriteSharedU32 : ValueOpcode::LoadSharedU32; break;
+						default: continue;
+					}
+					inst.Invalidate();
+					inst.ReplaceOpcode(opcode);
+					inst.SetArg(0, address);
+					inst.SetArg(1, write ? data : active);
+					if (write) inst.SetArg(2, active);
+					memory.kind = ResourceKind::Lds;
+					memory.address_is_full = false;
+					continue;
+				}
+				// The private aperture names each invocation's existing scratch storage.
+				// Preserve offsets, widths and execution masks; remove only its address tag.
+				auto scratch = block->PrependNewInst(it, ValueOpcode::GetScratchResource);
+				inst.SetArg(0, Value(&*scratch));
+				inst.SetArg(2, Value(0u));
+				memory.kind = ResourceKind::Scratch;
+			}
+		}
+	}
+
 	struct HandlePatch {
 		Inst*    handle   = nullptr;
 		uint32_t resource = 0;

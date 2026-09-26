@@ -888,11 +888,6 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
-	if (clamped_size == 0) {
-		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
-	}
 	if (clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
@@ -958,14 +953,25 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 
 bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
 	std::vector<VirtualRanges::Range> ranges;
+	const bool in_aperture = IsInPrtAperture(vaddr, size);
 	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
-	    !IsInPrtAperture(vaddr, size) || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+	    !in_aperture || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		VirtualRanges::Range range {};
+		if (g_virtual_ranges != nullptr && g_virtual_ranges->Query(vaddr, 0, &range)) {
+			std::printf("PRT read rejected: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " aperture=%d range=0x%016" PRIx64 "+0x%016" PRIx64 " type=%d\n",
+			     vaddr, size, in_aperture, range.start, range.size, static_cast<int>(range.type));
+		}
 		return false;
 	}
 	if (std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {
 		    return !IsReservedRangeType(range.type) &&
 		           !g_guest_address_space->BackingContains(range.start, range.size);
 	    })) {
+		for (const auto& range: ranges) {
+			std::printf("PRT missing backing: range=0x%016" PRIx64 "+0x%016" PRIx64 " type=%d\n",
+			            range.start, range.size, static_cast<int>(range.type));
+		}
 		return false;
 	}
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);

@@ -21,6 +21,8 @@ struct Lifecycle {
 
 enum class ShaderOptimizationType { None, Size, Performance };
 
+enum class StubShaderMode { None, All, Compute, Graphics, Pixel, Vertex };
+
 enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
@@ -54,6 +56,7 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
+	StubShaderMode         stub_shader_mode            = StubShaderMode::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -92,6 +95,7 @@ bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
+StubShaderMode         GetStubShaderMode();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 

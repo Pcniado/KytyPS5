@@ -708,9 +708,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
-		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		if (size == 0) {
+			EXIT("Memory: attempted to access invalid vertex buffer address 0x%016" PRIx64
+			     " with size 0x%016" PRIx64 "\n",
+			     range.base_address, range.RequestedSize());
+		}
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 		SetVulkanObjectNameF(

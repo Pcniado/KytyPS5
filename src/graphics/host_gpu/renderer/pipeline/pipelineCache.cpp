@@ -37,7 +37,22 @@
 #include <vector>
 #include <xxhash.h>
 
+#include "graphics/host_gpu/renderer/pipeline/basicShaders.h"
+
 namespace Libs::Graphics {
+
+static bool IsStubShaderStage(ShaderType stage) {
+	const auto mode = Config::GetStubShaderMode();
+	switch (mode) {
+		case Config::StubShaderMode::All: return true;
+		case Config::StubShaderMode::Compute: return stage == ShaderType::Compute;
+		case Config::StubShaderMode::Graphics: return stage != ShaderType::Compute;
+		case Config::StubShaderMode::Pixel: return stage == ShaderType::Pixel;
+		case Config::StubShaderMode::Vertex: return stage == ShaderType::Vertex;
+		case Config::StubShaderMode::None:
+		default: return false;
+	}
+}
 
 bool ShaderFailureNonFatal() {
 	return true;
@@ -297,6 +312,46 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
+		if (IsStubShaderStage(stage)) {
+			if (entry == programs.end()) {
+				entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
+				auto& source = entry->second;
+				source.resource_plan.stage = stage;
+				source.resource_plan.shader_hash = params.hash;
+				source.resource_plan.resource_tracking_complete = true;
+				source.resource_plan.srt_plan_complete = true;
+
+				Permutation perm;
+				perm.program.stage = stage;
+				perm.program.shader_hash = params.hash;
+				if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+					perm.program.wave_size = input_info.wave_size;
+					if (stage == ShaderType::Mesh) {
+						perm.program.wave_size = input_info.mesh.wave_size;
+					}
+				} else {
+					perm.program.wave_size = input_info.wave_size;
+				}
+				perm.handle = GetBasicShaderProgram(stage);
+				source.permutations.push_back(std::move(perm));
+
+				std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
+				for (const auto& [key, src]: programs) {
+					counts[static_cast<size_t>(key.stage)] += src.permutations.size();
+				}
+				std::printf("Shaders (BASIC): VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+				            counts[static_cast<size_t>(ShaderType::Vertex)],
+				            counts[static_cast<size_t>(ShaderType::Pixel)],
+				            counts[static_cast<size_t>(ShaderType::Compute)],
+				            counts[static_cast<size_t>(ShaderType::Mesh)],
+				            counts[static_cast<size_t>(ShaderType::Local)],
+				            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+				            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+			}
+			const auto& permutation = entry->second.permutations.back();
+			input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+			return permutation.handle;
+		}
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -401,14 +456,37 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	std::array<vk::ShaderModule, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> basic_modules {};
+
+	ShaderProgram GetBasicShaderProgram(ShaderType stage) {
+		const auto idx = static_cast<size_t>(stage);
+		if (idx < basic_modules.size() && basic_modules[idx] == nullptr) {
+			const auto spv = BasicShaders::GetBasicShaderSpv(stage);
+			basic_modules[idx] = CompileSPV(spv, device);
+			EXIT_IF(basic_modules[idx] == nullptr);
+		}
+		return {
+			.id = ++next_shader_id,
+			.module = (idx < basic_modules.size()) ? basic_modules[idx] : nullptr,
+		};
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		std::unordered_set<vk::ShaderModule> destroyed_modules;
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.handle.module && destroyed_modules.insert(permutation.handle.module).second) {
+					device.destroyShaderModule(permutation.handle.module, nullptr);
+				}
+			}
+		}
+		for (const auto& module: basic_modules) {
+			if (module && destroyed_modules.insert(module).second) {
+				device.destroyShaderModule(module, nullptr);
 			}
 		}
 	}
@@ -458,12 +536,9 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+		const std::string suffix = (Config::GetStubShaderMode() != Config::StubShaderMode::None) ? "_stub" : "";
+	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + suffix + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
